@@ -30,13 +30,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. Relayer wallet + provider.
     //    Built *before* spawning the worker so that a bad key / unreachable RPC fails
     //    loudly at startup instead of silently killing the background task.
-    let signer: PrivateKeySigner = std::env::var("PRIVATE_KEY")
-        .expect("PRIVATE_KEY not set")
-        .parse()?;
+    // let signer: PrivateKeySigner = std::env::var("PRIVATE_KEY")
+    //     .expect("PRIVATE_KEY not set")
+    //     .parse()?;
+    let signer = PrivateKeySigner::random();
     let wallet = EthereumWallet::from(signer);
 
     let rpc_url = std::env::var("RPC_URL").unwrap_or_else(|_| "http://127.0.0.1:8545".to_string());
-    let provider = ProviderBuilder::new().wallet(wallet).connect(&rpc_url).await?;
+    let provider = ProviderBuilder::new()
+        .wallet(wallet)
+        .connect(&rpc_url)
+        .await?;
 
     // EIP-2771 trusted forwarder that every intent is relayed to.
     // TODO: point this at your deployed forwarder, or export FORWARDER_ADDRESS.
@@ -50,13 +54,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(req) = tx_receiver.recv().await {
             // NOTE: `signature` is only logged -- it is never verified. A real relayer MUST
             // recover the signer from it and reject intents that do not match `req.user`.
-            println!("Processing intent for: {} (sig: {})", req.user, req.signature);
+            println!(
+                "Processing intent for: {} (sig: {})",
+                req.user, req.signature
+            );
 
             // Translate the off-chain intent into an on-chain call:
             // to = trusted forwarder, input = the intent's calldata.
             let call = TransactionRequest::default()
                 .with_to(forwarder)
-                .with_input(Bytes::from(alloy::hex::decode(&req.data).unwrap_or_default()));
+                .with_input(Bytes::from(
+                    alloy::hex::decode(&req.data).unwrap_or_default(),
+                ));
 
             // Simulation Step (Dry-run)
             // if !dry_run(&provider, &call).await { continue; }
