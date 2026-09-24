@@ -211,3 +211,175 @@ async fn main() {
 5. **`FORWARDER_ADDRESS` defaults to `0x0000...0000`.** Deploy a real EIP-2771 trusted
    forwarder and relay through it.
 
+
+---
+
+# Day 4: The Hardened Relayer (this is the current code)
+
+Days 2 and 3 built a relayer that *works*. Day 4 hardens one that *survives*. The Day 2/3 pipeline is
+still visible in git history; the code you have now adds six defences, each closing a specific way to
+steal from the relayer's balance.
+
+```
+POST /submit
+    |
+    v
+[1] verify_intent()        EIP-712: recovery, canonicality, deadline window, calldata bound
+    |
+    v
+[2] dry_run(eth_call)      THE PRIMARY DEFENCE: never pay for a transaction that reverts
+    |
+    v
+[3] ReplayGuard::claim()   check-and-insert in ONE lock: digest AND (user, nonce)
+    |
+    v
+[4] mpsc queue             bounded: a full queue returns 503 instead of growing
+    |
+    v
+[5] re-simulate + send     to the PRIVATE mempool when one is configured
+    |
+    v
+[6] receipts -> metrics     relayer_gas_burned_on_reverts_wei must be 0, and you can prove it
+```
+
+## Source map
+
+| File | What it defends against |
+|---|---|
+| `src/intent.rs` | Forged, malleable, expired, unbounded, calldata-swapped signatures (EIP-712) |
+| `src/replay.rs` | The same intent relayed twice — including nonce-reuse behind a fresh digest |
+| `src/dry_run.rs` | Griefing: a *validly signed* intent whose call reverts, so the relayer pays |
+| `src/secure_key.rs` | Key leakage: no globals, no `Debug`, no error messages, wiped on drop |
+| `src/metrics.rs` | Blindness: every refusal is counted, so an attack has a shape you can see |
+| `src/config.rs` | Configuration, plus a 20-line `.env` loader (no `dotenvy` needed) |
+| `src/main.rs` | The gates, the API, and one sequential worker |
+| `src/bin/simulator.rs` | Honest traffic **and** ten attack modes |
+| `scripts/break_my_code.sh` | The Part 4 self-grading suite |
+| `SECURITY_AUDIT_CHECKLIST.md` | 40-point self-audit for the final project |
+| `WORKSHOP.md` | The 4-hour run sheet |
+
+## Running it
+
+```bash
+anvil                                     # T1
+cargo run                                 # T2: relayer on 127.0.0.1:3000
+cargo test --lib                          # 24 unit proofs of the security claims
+
+# T3 - honest traffic
+cargo run --bin simulator -- honest 20
+
+# T3 - adversarial traffic (Part 4)
+cargo run --bin simulator -- replay 5          # 1 x 202, 4 x 409
+cargo run --bin simulator -- nonce-reuse 4     # 1 x 202, 3 x 409 nonce_taken
+cargo run --bin simulator -- malleable 3       # 3 x 401
+cargo run --bin simulator -- badsig 3          # 3 x 401
+cargo run --bin simulator -- expired 3         # 3 x 400
+cargo run --bin simulator -- far-deadline 3    # 3 x 400
+cargo run --bin simulator -- empty-calldata 3  # 3 x 400
+cargo run --bin simulator -- garbage 3         # 3 x 400
+cargo run --bin simulator -- mixed 40          # ALL of the above, interleaved
+./scripts/break_my_code.sh --grief             # the whole suite + the griefing demo
+
+# T4 - the scoreboard
+curl -s 127.0.0.1:3000/metrics | grep -v '^#'
+curl -s 127.0.0.1:3000/domain | python3 -m json.tool
+```
+
+Use `127.0.0.1`, never `localhost`: the listener is IPv4-only and on macOS `localhost` can resolve to
+`::1` first.
+
+## The API
+
+| Route | Purpose |
+|---|---|
+| `POST /submit` | `{user, nonce, deadline, data, signature}` → `202`, or `400`/`401`/`409`/`422`/`503` with a machine-readable `code` |
+| `GET /domain` | The EIP-712 parameters a client must sign against (nothing secret: `chainId` and `verifyingContract` are the point) |
+| `GET /metrics` | Prometheus text, including `relayer_gas_burned_on_reverts_wei` |
+| `GET /health` | Liveness only |
+
+Status codes are chosen deliberately: `400` malformed, `401` the signature does not prove the claim,
+`409` valid but already spent, `422` authentic but would revert (refused on economics, not identity),
+`503` our fault, retry later.
+
+## Configuration
+
+See `.env.example` for everything. The interesting ones:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `PRIVATE_KEY` | *(none)* | The God Key. Unset = a throwaway key and a warning |
+| `RPC_URL` | `http://127.0.0.1:8545` | Full node: `eth_call`, chain id, receipts |
+| `PRIVATE_RPC_URL` / `FLASHBOTS_RPC_URL` | *(none)* | Broadcast endpoint. Set → the signed tx never enters the public mempool |
+| `FORWARDER_ADDRESS` | `0x0000...0000` | Relayed-to contract, bound into the domain separator |
+| `MAX_SEEN_ENTRIES` | `100000` | Bound on the replay registry |
+| `QUEUE_CAPACITY` | `100` | Back-pressure threshold |
+| `AWAIT_RECEIPTS` | `1` | Measure the gas; `0` = fire and forget |
+| `DRY_RUN` | `1` | **Lab switch.** `0` = skip the primary defence (to show the loss) |
+| `GAS_LIMIT` | *(none)* | Explicit gas limit; also skips `eth_estimateGas` |
+
+## Demonstration: the loss, then the defence
+
+`DRY_RUN=0` with a reverting forwarder shows what an undefended relayer does:
+
+```bash
+cast rpc anvil_setCode 0x0000000000000000000000000000000000000000 0x60006000fd  # PUSH1 0 PUSH1 0 REVERT
+cast block-number                                       # 130
+DRY_RUN=0 GAS_LIMIT=100000 cargo run                    # T2: 'DRY RUN OFF'
+cargo run --bin simulator -- honest 5                   # 5 x 202 Accepted
+cast block-number                                       # 135  <- five mined, five failed
+curl -s 127.0.0.1:3000/metrics | grep gas_burned        # ~2_991_940 wei, paid for nothing
+```
+
+Then restart with the dry run on, on the same broken destination:
+
+```bash
+cargo run                                               # T2: 'DRY RUN ON'
+cargo run --bin simulator -- honest 5                   # 5 x 422 Unprocessable Entity
+cast block-number                                       # unchanged
+curl -s 127.0.0.1:3000/metrics | grep gas_burned        # 0
+```
+
+> Worth knowing: by default Alloy's gas filler calls `eth_estimateGas` first, and estimation *also*
+> reverts — so a reverting transaction would never have been broadcast at all. That is a free dry
+> run inside a dependency. It is useful to know and unwise to rely on: it is one extra round trip,
+> it does not classify the failure, and it happens after your queue slot is spent. `GAS_LIMIT`
+> removes the crutch so the lesson is honest.
+
+## Part 3: private orderflow
+
+The relayer keeps **two** providers, because simulation and broadcast are different jobs. A private
+relay (Flashbots) cannot serve `eth_call`; it only has orderflow.
+
+```bash
+anvil -p 8546 &                                     # stand-in for relay.flashbots.net
+PRIVATE_RPC_URL=http://127.0.0.1:8546 cargo run     # T2: 'broadcast to ... PRIVATE MEMPOOL'
+cargo run --bin simulator -- honest 3
+cast block-number --rpc-url http://127.0.0.1:8545   # unchanged
+cast block-number --rpc-url http://127.0.0.1:8546   # +3
+```
+
+For real Flashbots, change one URL. Note the nonce caveat: a relay will not answer
+`eth_getTransactionCount`, so production relayers fetch the nonce from the public node and set it
+explicitly rather than letting the filler ask the relay.
+
+## Exercises carried over from Day 3 (now answered)
+
+The five items left open in the Day 2/3 README are closed by today's code. Read them as a diff:
+
+1. **Signature never verified** → `intent::verify_intent`, with EIP-712 domain binding.
+2. **`.env` not loaded** → `config::load_dotenv` (20 lines, no dependency).
+3. **Dry-run still a comment** → `dry_run.rs`, wired into both the handler and the worker.
+4. **Sequential throughput** → still sequential, on purpose: one transaction at a time keeps nonces
+   monotonic. Concurrency is an availability problem; reordering transactions is a security problem.
+5. **Forwarder defaults to the zero address** → still defaults, so the pipeline is demonstrable
+   before you deploy. Point it at a real EIP-2771 forwarder for anything real.
+
+## Still deliberately out of scope (write these down)
+
+| Gap | Production answer |
+|---|---|
+| Replay registry is per-process, in memory | Shared store (Redis) keyed by digest; nonce stays the on-chain source of truth |
+| No rate limit per caller | Token bucket per IP/user; the queue bound is the last resort |
+| Dry run cannot close TOCTOU | Bounded gas, private orderflow, receipt monitoring, alerting |
+| Key comes from an environment variable | KMS/HSM signer: the process never holds key bytes |
+| One `eth_call` per intent | Batch (`eth_callMany`) or local state simulation |
