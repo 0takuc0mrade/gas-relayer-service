@@ -158,6 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The chain id is bound into the EIP-712 domain, so a signature harvested on another
     // chain cannot be replayed here.
     let chain_id = sim_provider.get_chain_id().await?;
+
+    // A forwarder with **no code** is the lab's default (the zero address). Sending calldata to an
+    // account with no code *succeeds* and does nothing: every relay is confirmed, no user state
+    // changes, and nothing is forwarded. That is exactly what you want before you have deployed
+    // anything, and exactly the failure you never notice in production — so check, and say so.
+    let forwarder_is_contract = !sim_provider.get_code_at(config.forwarder).await?.is_empty();
+
     // Two clones of one connection: one for the request handler (fast, synchronous rejections),
     // one for the worker (last-chance check). `DynProvider` is `Arc<dyn Provider>` internally, so
     // cloning is cheap and both share the same connection pool.
@@ -181,7 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_sender, tx_receiver) = mpsc::channel::<VerifiedIntent>(config.queue_capacity);
     let queue_capacity = config.queue_capacity;
 
-    banner(&config, relayer, chain_id);
+    banner(&config, relayer, chain_id, forwarder_is_contract);
 
     // ---------------------------------------------------------------------------------
     // The worker: sequential, and the reason is nonces. One transaction at a time in arrival
@@ -227,7 +234,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health_handler))
         .with_state(Arc::clone(&state));
 
-    let listener = tokio::net::TcpListener::bind(&config.bind_addr).await?;
+    let listener = tokio::net::TcpListener::bind(&config.bind_addr)
+        .await
+        .map_err(|e| {
+            format!(
+                "cannot bind {}: {e}\n   is another relayer already running? \
+                 check with: lsof -nP -iTCP:3000 -sTCP:LISTEN",
+                config.bind_addr
+            )
+        })?;
     println!("🚀 relayer listening on http://{}\n", config.bind_addr);
 
     axum::serve(listener, app)
@@ -243,7 +258,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Startup summary. Note that it prints the relayer's **address**, never its key.
-fn banner(config: &Config, relayer: Address, chain_id: u64) {
+fn banner(config: &Config, relayer: Address, chain_id: u64, forwarder_is_contract: bool) {
     println!("┌─ hardened relayer ─────────────────────────────────────────────");
     println!("│ relayer address   {relayer}");
     println!("│ chain id          {chain_id}");
@@ -258,6 +273,11 @@ fn banner(config: &Config, relayer: Address, chain_id: u64) {
         }
     );
     println!("│ trusted forwarder {}", config.forwarder);
+    if !forwarder_is_contract {
+        println!("│   ⚠️  that address has NO CODE on chain {chain_id}.");
+        println!("│       Relays will be mined, report success, and forward nothing.");
+        println!("│       Fine for the lab; set FORWARDER_ADDRESS for anything real.");
+    }
     println!(
         "│ EIP-712 domain    {}/{}",
         config.eip712_name, config.eip712_version

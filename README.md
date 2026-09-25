@@ -18,18 +18,15 @@ traffic_simulator/
 # Terminal 1 - start a local chain
 anvil
 
-# Terminal 2 - load the relayer key into the shell.
-# NOTE: there is no dotenvy in this project, so `.env` is NOT read for you:
-# the process needs a real environment variable.
-set -a; source .env; set +a      # or: export PRIVATE_KEY=0x...
-# Optional overrides:
-# export RPC_URL=http://127.0.0.1:8545
-# export FORWARDER_ADDRESS=0x<deployed EIP-2771 forwarder>
-
+# Terminal 2 - start the relayer. It loads `.env` itself (src/config.rs, no `dotenvy`
+# dependency), so there is nothing to `source` as long as you start it from the repo root.
 cargo run                        # relayer API on 127.0.0.1:3000
 
-# Terminal 3 - bombard the relayer with 50 concurrent intents
-cargo run --bin simulator
+# Real environment variables always beat `.env`, so overrides look like this:
+# RPC_URL=http://127.0.0.1:8545 FORWARDER_ADDRESS=0x<deployed EIP-2771 forwarder> cargo run
+
+# Terminal 3 - honest traffic (50 concurrent intents)
+cargo run --bin simulator -- honest 50
 
 # Terminal 4 - verify what actually landed on chain
 cast block-number
@@ -202,8 +199,9 @@ async fn main() {
 
 1. **`signature` is never verified.** The relayer relays any payload it is handed. Recover the
    signer from `signature` and reject intents whose recovered address does not match `user`.
-2. **`dotenvy` is not a dependency**, so `.env` is not read automatically -- the shell must
-   export `PRIVATE_KEY`. Make `.env` load automatically.
+2. ~~**`dotenvy` is not a dependency**, so `.env` is not read automatically~~ — solved on Day 4
+   without adding a dependency: `config::load_dotenv` in `src/config.rs` (20 lines; real environment
+   variables still take precedence). Read from the repository root, or the file is not found.
 3. **The dry-run step is still a comment.** Implement the `eth_call` simulation
    (`provider.call(&call)`) and skip intents that would revert.
 4. **Throughput is one transaction at a time.** Deliberately sequential, to keep nonces sane.
@@ -257,6 +255,7 @@ POST /submit
 | `scripts/break_my_code.sh` | The Part 4 self-grading suite |
 | `SECURITY_AUDIT_CHECKLIST.md` | 40-point self-audit for the final project |
 | `WORKSHOP.md` | The 4-hour run sheet |
+| `RUNBOOK.md` | Step-by-step operation, gotchas, and what changes in production |
 
 ## Running it
 

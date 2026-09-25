@@ -136,6 +136,8 @@ not a developer who writes relayer code any more. You are a **protocol engineer*
 | Gap | Why it is acceptable *for this lab* | What production does |
 |---|---|---|
 | Replay registry is in-memory and per-process | Single instance, nonce is still enforced on chain | Shared store (Redis) keyed by digest, plus on-chain nonce as source of truth |
+| A transport failure *after* the claim strands that `(user, nonce)` until eviction: the user cannot retry, because a re-signed intent is a new digest on a spent nonce | Fail-closed beats double-spend, and a retry is a support ticket rather than a theft | Durable outbox: on transport failure, keep retrying the *original* bytes and reconcile against the chain once it is reachable. Release the claim only after the chain confirms the nonce is untouched |
+| The queue is in memory: a restart drops whatever is queued | Classroom volume, and the client can resubmit | Durable queue/outbox with an idempotency key; drain before deploy |
 | No rate limiting per caller | The lab runs on localhost | Token bucket per IP/user; queue bound is the last resort |
 | Dry run cannot close TOCTOU | Narrowed with a pre-broadcast re-check and measured | Bounded gas, private orderflow, receipt monitoring |
 | Key is read from an environment variable | Convenient and demonstrative | KMS/HSM signer; the process never holds key bytes |

@@ -66,6 +66,9 @@ enum Mode {
     Garbage,
     /// Interleave honest intents and every attack. The self-grading run.
     Mixed,
+    /// Sign one intent and print it as JSON instead of submitting. The building block for every
+    /// hand-run `curl` experiment, including the "restart the relayer and replay" test.
+    Dump,
 }
 
 impl Mode {
@@ -81,12 +84,13 @@ impl Mode {
             "empty-calldata" => Self::EmptyCalldata,
             "garbage" => Self::Garbage,
             "mixed" => Self::Mixed,
+            "dump" | "intent" => Self::Dump,
             _ => return None,
         })
     }
 
     fn is_attack(self) -> bool {
-        !matches!(self, Self::Honest)
+        !matches!(self, Self::Honest | Self::Dump)
     }
 }
 
@@ -120,6 +124,13 @@ struct RemoteDomain {
     /// Printed in the banner, so students can see the domain separator binding the contract.
     separator: String,
     forwarder: Address,
+    chain_id: u64,
+}
+
+/// A clock-derived nonce base, so that running the same demo twice in a row does not collide with
+/// the relayer's used-signature registry (which is exactly what a replay looks like).
+fn nonce_base() -> u64 {
+    (unix_now() * 1_000) % (u64::MAX / 2)
 }
 
 async fn fetch_domain(client: &Client, base: &str) -> Result<RemoteDomain, String> {
@@ -156,6 +167,7 @@ async fn fetch_domain(client: &Client, base: &str) -> Result<RemoteDomain, Strin
             .unwrap_or("?")
             .to_string(),
         forwarder,
+        chain_id,
     })
 }
 
@@ -287,6 +299,8 @@ fn build(mode: Mode, count: usize, domain: &Eip712Domain, base_nonce: u64) -> Ve
                 Payload { body, attack: true }
             })
             .collect(),
+
+        Mode::Dump => vec![honest(base_nonce)],
 
         Mode::Mixed => {
             // Every attack, interleaved with legitimate traffic, so a defence that rejects
@@ -441,13 +455,44 @@ async fn main() {
         }
     };
 
+    // `dump` is a *build tool*, not traffic. It writes exactly one correctly signed body to stdout
+    // — so `> /tmp/intent.json` needs no cleanup — and every human-readable hint to stderr. This is
+    // the building block for every hand-run `curl` experiment in the runbook.
+    if mode == Mode::Dump {
+        let base_nonce = nonce_base();
+        let payloads = build(Mode::Dump, 1, &remote.domain, base_nonce);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payloads[0].body).expect("intent is serializable")
+        );
+        eprintln!("# signed for {base}/submit");
+        eprintln!("#   forwarder        {}", remote.forwarder);
+        eprintln!("#   chain id         {}", remote.chain_id);
+        eprintln!("#   domain separator {}", remote.separator);
+        eprintln!("#   nonce            {base_nonce}");
+        eprintln!("#");
+        eprintln!("# send it twice, then restart the relayer and send it a third time:");
+        eprintln!("#   cargo run --bin simulator -- dump > /tmp/intent.json");
+        eprintln!(
+            "#   curl -s -X POST -H 'content-type: application/json' -d @/tmp/intent.json {base}/submit   # 202"
+        );
+        eprintln!(
+            "#   curl -s -X POST -H 'content-type: application/json' -d @/tmp/intent.json {base}/submit   # 409 replayed"
+        );
+        eprintln!("#   <restart the relayer>");
+        eprintln!(
+            "#   curl -s -X POST -H 'content-type: application/json' -d @/tmp/intent.json {base}/submit   # 202 again <- the gap"
+        );
+        return;
+    }
+
     println!("target            {base}/submit");
     println!("forwarder         {}", remote.forwarder);
     println!("domain separator  {}", remote.separator);
 
     // A clock-derived nonce base: run the same demo twice and the second run does not look like
     // a replay attack.
-    let base_nonce = (unix_now() * 1_000) % (u64::MAX / 2);
+    let base_nonce = nonce_base();
     let payloads = build(mode, count, &remote.domain, base_nonce);
     let attacks = payloads.iter().filter(|p| p.attack).count();
     let honest = payloads.len() - attacks;
